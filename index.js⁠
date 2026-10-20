@@ -1,37 +1,156 @@
-const { default: makeWASocket, useMultiFileAuthState, DisconnectReason } = require('@whiskeysockets/baileys');
+const {
+  default: makeWASocket,
+  useMultiFileAuthState,
+  DisconnectReason
+} = require('@whiskeysockets/baileys');
 const pino = require('pino');
+const http = require('http');
+
+// Puerto para que Render detecte el servicio web.
+http.createServer((req, res) => {
+  res.writeHead(200, { 'Content-Type': 'text/plain' });
+  res.end('Bot activo');
+}).listen(process.env.PORT || 3000);
 
 async function connectToWhatsApp() {
-    const { state, saveCreds } = await useMultiFileAuthState('auth_info_baileys');
-    
-    const sock = makeWASocket({
-        logger: pino({ level: 'silent' }),
-        printQRInTerminal: true,
-        auth: state
-    });
+  const { state, saveCreds } =
+    await useMultiFileAuthState('auth_info_baileys');
 
-    sock.ev.on('creds.update', saveCreds);
+  const sock = makeWASocket({
+    logger: pino({ level: 'warn' }),
+    printQRInTerminal: true,
+    auth: state
+  });
 
-    sock.ev.on('connection.update', (update) => {
-        const { connection, lastDisconnect } = update;
-        if(connection === 'close') {
-            const shouldReconnect = (lastDisconnect.error)?.output?.statusCode !== DisconnectReason.loggedOut;
-            console.log('Conexión cerrada. Reconectando...', shouldReconnect);
-            if(shouldReconnect) {
-                connectToWhatsApp();
-            }
-        } else if(connection === 'open') {
-            console.log('¡Bot de WhatsApp conectado exitosamente!');
+  sock.ev.on('creds.update', saveCreds);
+
+  sock.ev.on('connection.update', (update) => {
+    const { connection, lastDisconnect } = update;
+
+    if (connection === 'open') {
+      console.log('¡Bot conectado!');
+    }
+
+    if (connection === 'close') {
+      const status =
+        lastDisconnect?.error?.output?.statusCode;
+
+      if (status !== DisconnectReason.loggedOut) {
+        setTimeout(() => {
+          connectToWhatsApp().catch(console.error);
+        }, 5000);
+      } else {
+        console.log('Sesión cerrada: hay que vincular de nuevo.');
+      }
+    }
+  });
+
+  sock.ev.on('messages.upsert', async ({ messages, type }) => {
+    if (type !== 'notify') return;
+
+    for (const msg of messages) {
+      const jid = msg.key.remoteJid;
+      if (!msg.message || !jid || jid === 'status@broadcast') {
+        continue;
+      }
+
+      const content =
+        msg.message.ephemeralMessage?.message || msg.message;
+
+      const text = (
+        content.conversation ||
+        content.extendedTextMessage?.text ||
+        content.imageMessage?.caption ||
+        content.videoMessage?.caption ||
+        ''
+      ).trim().toLowerCase();
+
+      // Solo responde a estos comandos.
+      const command = text.replace(/^[.!/]/, '');
+      if (!['ping', 'menu', 'open', 'close'].includes(command)) {
+        continue;
+      }
+
+      try {
+        const reply = (text) =>
+          sock.sendMessage(jid, { text }, { quoted: msg });
+
+        if (command === 'ping') {
+          await reply('¡Aquí estoy! 💜');
+          continue;
         }
-    });
 
-    sock.ev.on('messages.upsert', async m => {
-        const msg = m.messages[0];
-        if (!msg.message || msg.key.fromMe) return;
-        
-        console.log('Mensaje recibido:', JSON.stringify(msg, undefined, 2));
-    });
+        if (command === 'menu') {
+          await reply(
+            '💜 MENÚ DEL GRUPO\n\n' +
+            '.ping — Comprobar el bot\n' +
+            '.menu — Mostrar este menú\n' +
+            '.open — Abrir el grupo\n' +
+            '.close — Cerrar el grupo\n\n' +
+            'Abrir y cerrar: solo administradoras.'
+          );
+          continue;
+        }
+
+        if (!jid.endsWith('@g.us')) {
+          await reply('Ese comando funciona dentro de un grupo.');
+          continue;
+        }
+
+        const group = await sock.groupMetadata(jid);
+        const normalize = (id = '') =>
+          id.replace(/:\d+(?=@)/, '');
+
+        const sender = msg.key.fromMe
+          ? sock.user.id
+          : msg.key.participant;
+
+        const participant = group.participants.find(
+          (p) => normalize(p.id) === normalize(sender)
+        );
+
+        if (!participant?.admin) {
+          await reply('Solo las administradoras pueden hacer eso.');
+          continue;
+        }
+
+        await sock.groupSettingUpdate(
+          jid,
+          command === 'close'
+            ? 'announcement'
+            : 'not_announcement'
+        );
+
+        await reply(
+          command === 'close'
+            ? '🔒 Grupo cerrado. Solo escriben administradoras.'
+            : '🔓 Grupo abierto. Ya pueden escribir todas.'
+        );
+      } catch (error) {
+        console.error('Error del comando:', error);
+        await sock.sendMessage(jid, {
+          text: 'No pude hacerlo. Si intentabas abrir o cerrar, revisá que el bot sea administrador.'
+        }).catch(console.error);
+      }
+    }
+  });
+
+  sock.ev.on('group-participants.update', async (event) => {
+    if (event.action !== 'add') return;
+
+    try {
+      await sock.sendMessage(event.id, {
+        text:
+          '¡Bienvenidas! 💜\n\n' +
+          'Este es un espacio para compartir, conocer nuevas ' +
+          'amigas y ser ustedes mismas.\n\n' +
+          'Respeten las reglas y los límites de las demás. ' +
+          'Escriban .menu para ver los comandos.'
+      });
+    } catch (error) {
+      console.error('Error de bienvenida:', error);
+    }
+  });
 }
 
-connectToWhatsApp();
-
+connectToWhatsApp().catch(console.error);
